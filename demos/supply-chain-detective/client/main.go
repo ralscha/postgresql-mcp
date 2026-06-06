@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -42,7 +43,7 @@ func run() int {
 	}
 
 	fmt.Printf("Starting supply-chain detective client with model %q.\n", os.Getenv("OPENAI_MODEL"))
-	fmt.Printf("Connecting to postgresql-mcp in %q for database %q.\n", serverDir(), os.Getenv("POSTGRESQL_DATABASE"))
+	printMCPConnection()
 
 	mcpClient, err := connectMCP(ctx)
 	if err != nil {
@@ -93,11 +94,34 @@ func ensureEnv() error {
 	}
 	defaultEnv("POSTGRESQL_SSLMODE", "disable")
 	defaultEnv("POSTGRESQL_ACCESS_LEVEL", "READONLY")
+	defaultEnv("POSTGRESQL_TRANSPORT", "stdio")
+	defaultEnv("POSTGRESQL_HTTP_ADDR", ":8080")
+	defaultEnv("POSTGRESQL_SSE_PATH", "/sse")
 	defaultEnv("OPENAI_MODEL", "gpt-4o-mini")
 	return nil
 }
 
 func connectMCP(ctx context.Context) (*client.Client, error) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("POSTGRESQL_TRANSPORT"))) {
+	case "", "stdio":
+		return connectStdioMCP(ctx)
+	case "sse":
+		return connectSSEMCP(ctx)
+	default:
+		return nil, fmt.Errorf("unsupported POSTGRESQL_TRANSPORT %q, expected stdio or sse", os.Getenv("POSTGRESQL_TRANSPORT"))
+	}
+}
+
+func printMCPConnection() {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("POSTGRESQL_TRANSPORT"))) {
+	case "sse":
+		fmt.Printf("Connecting to postgresql-mcp over SSE at %q for database %q.\n", sseEndpoint(), os.Getenv("POSTGRESQL_DATABASE"))
+	default:
+		fmt.Printf("Connecting to postgresql-mcp over stdio in %q for database %q.\n", serverDir(), os.Getenv("POSTGRESQL_DATABASE"))
+	}
+}
+
+func connectStdioMCP(ctx context.Context) (*client.Client, error) {
 	stdio := transport.NewStdioWithOptions(
 		"go",
 		os.Environ(),
@@ -135,6 +159,59 @@ func connectMCP(ctx context.Context) (*client.Client, error) {
 		return nil, fmt.Errorf("initialize MCP session: %w", err)
 	}
 	return c, nil
+}
+
+func connectSSEMCP(ctx context.Context) (*client.Client, error) {
+	endpoint := sseEndpoint()
+	c, err := client.NewSSEMCPClient(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.Start(ctx); err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("start SSE MCP client for %s: %w", endpoint, err)
+	}
+
+	initRequest := mcp.InitializeRequest{}
+	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initRequest.Params.ClientInfo = mcp.Implementation{
+		Name:    "supply-chain-detective-eino-client",
+		Version: "0.1.0",
+	}
+	initRequest.Params.Capabilities = mcp.ClientCapabilities{}
+
+	if _, err := c.Initialize(ctx, initRequest); err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("initialize MCP session: %w", err)
+	}
+	return c, nil
+}
+
+func sseEndpoint() string {
+	if endpoint := strings.TrimSpace(os.Getenv("POSTGRESQL_SSE_URL")); endpoint != "" {
+		return endpoint
+	}
+
+	addr := strings.TrimSpace(os.Getenv("POSTGRESQL_HTTP_ADDR"))
+	if addr == "" {
+		addr = ":8080"
+	}
+	path := strings.TrimSpace(os.Getenv("POSTGRESQL_SSE_PATH"))
+	if path == "" {
+		path = "/sse"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "http://" + strings.TrimRight(addr, "/") + path
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port) + path
 }
 
 func runAgent(ctx context.Context, mcpClient *client.Client) (string, error) {

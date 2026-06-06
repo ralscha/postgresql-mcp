@@ -10,11 +10,15 @@ import (
 )
 
 type AccessLevel string
+type Transport string
 
 const (
 	ReadOnly AccessLevel = "READONLY"
 	DMLRW    AccessLevel = "DML-RW"
 	DDLRW    AccessLevel = "DDL-RW"
+
+	StdioTransport Transport = "stdio"
+	SSETransport   Transport = "sse"
 )
 
 type Config struct {
@@ -29,6 +33,9 @@ type Config struct {
 	QueryTimeout        time.Duration
 	MaxRowsDefault      int
 	RequireConfirmation bool
+	Transport           Transport
+	HTTPAddr            string
+	SSEPath             string
 }
 
 var validSSLModes = map[string]bool{
@@ -55,6 +62,19 @@ func ParseAccessLevel(s string) (AccessLevel, error) {
 	}
 }
 
+func ParseTransport(s string) (Transport, error) {
+	switch Transport(strings.ToLower(strings.TrimSpace(s))) {
+	case "":
+		return StdioTransport, nil
+	case StdioTransport:
+		return StdioTransport, nil
+	case SSETransport:
+		return SSETransport, nil
+	default:
+		return "", fmt.Errorf("invalid POSTGRESQL_TRANSPORT %q, expected stdio or sse", s)
+	}
+}
+
 func (l AccessLevel) AllowsDML() bool {
 	return l == DMLRW || l == DDLRW
 }
@@ -65,6 +85,10 @@ func (l AccessLevel) AllowsDDL() bool {
 
 func Load() (Config, error) {
 	level, err := ParseAccessLevel(os.Getenv("POSTGRESQL_ACCESS_LEVEL"))
+	if err != nil {
+		return Config{}, err
+	}
+	transport, err := ParseTransport(os.Getenv("POSTGRESQL_TRANSPORT"))
 	if err != nil {
 		return Config{}, err
 	}
@@ -80,6 +104,9 @@ func Load() (Config, error) {
 		QueryTimeout:        durationSecondsEnv("POSTGRESQL_QUERY_TIMEOUT", 120*time.Second),
 		MaxRowsDefault:      intEnv("POSTGRESQL_MAX_ROWS_DEFAULT", 1000),
 		RequireConfirmation: boolEnv("POSTGRESQL_REQUIRE_CONFIRMATION", true),
+		Transport:           transport,
+		HTTPAddr:            stringEnv("POSTGRESQL_HTTP_ADDR", ":8080"),
+		SSEPath:             stringEnv("POSTGRESQL_SSE_PATH", "/sse"),
 	}
 	return cfg, cfg.Validate()
 }
@@ -112,6 +139,15 @@ func (c Config) Validate() error {
 	if c.MaxRowsDefault <= 0 || c.MaxRowsDefault > 100000 {
 		return fmt.Errorf("POSTGRESQL_MAX_ROWS_DEFAULT must be between 1 and 100000")
 	}
+	if c.Transport != StdioTransport && c.Transport != SSETransport {
+		return fmt.Errorf("POSTGRESQL_TRANSPORT must be stdio or sse")
+	}
+	if c.HTTPAddr == "" {
+		return fmt.Errorf("POSTGRESQL_HTTP_ADDR is required")
+	}
+	if !strings.HasPrefix(c.SSEPath, "/") {
+		return fmt.Errorf("POSTGRESQL_SSE_PATH must start with /")
+	}
 	return nil
 }
 
@@ -142,6 +178,9 @@ func (c Config) PublicSummary() map[string]any {
 		"queryTimeoutSec":      int(c.QueryTimeout.Seconds()),
 		"maxRowsDefault":       c.MaxRowsDefault,
 		"requireConfirmation":  c.RequireConfirmation,
+		"transport":            c.Transport,
+		"httpAddr":             c.HTTPAddr,
+		"ssePath":              c.SSEPath,
 	}
 }
 

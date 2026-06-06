@@ -28,6 +28,31 @@ func TestParseAccessLevel(t *testing.T) {
 	}
 }
 
+func TestParseTransport(t *testing.T) {
+	tests := []struct {
+		in   string
+		want Transport
+		ok   bool
+	}{
+		{"", StdioTransport, true},
+		{"stdio", StdioTransport, true},
+		{"SSE", SSETransport, true},
+		{"http", "", false},
+	}
+	for _, tt := range tests {
+		got, err := ParseTransport(tt.in)
+		if tt.ok && err != nil {
+			t.Fatalf("ParseTransport(%q) unexpected error: %v", tt.in, err)
+		}
+		if !tt.ok && err == nil {
+			t.Fatalf("ParseTransport(%q) expected error", tt.in)
+		}
+		if got != tt.want {
+			t.Fatalf("ParseTransport(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestAccessLevelPermissions(t *testing.T) {
 	if ReadOnly.AllowsDML() || ReadOnly.AllowsDDL() {
 		t.Fatal("READONLY should not allow writes")
@@ -52,5 +77,32 @@ func TestSSLModeValidation(t *testing.T) {
 		if validSSLModes[mode] {
 			t.Fatalf("%q should not be a valid sslmode", mode)
 		}
+	}
+}
+
+func TestValidateTransportConfig(t *testing.T) {
+	cfg := Config{
+		AccessLevel:         ReadOnly,
+		Host:                "localhost",
+		Port:                5432,
+		Database:            "db",
+		User:                "postgres",
+		Password:            "password",
+		SSLMode:             "disable",
+		ConnectionTimeout:   1,
+		QueryTimeout:        1,
+		MaxRowsDefault:      1,
+		Transport:           SSETransport,
+		HTTPAddr:            ":8080",
+		SSEPath:             "/sse",
+		RequireConfirmation: true,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+
+	cfg.SSEPath = "sse"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() expected error for SSE path without leading slash")
 	}
 }

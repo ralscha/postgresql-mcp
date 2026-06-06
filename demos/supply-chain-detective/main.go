@@ -176,6 +176,10 @@ func writeDemoEnv(host, port string) error {
 	}
 	defaults := map[string]string{
 		"POSTGRESQL_MCP_SERVER_DIR": "../..",
+		"POSTGRESQL_TRANSPORT":      "stdio",
+		"POSTGRESQL_HTTP_ADDR":      ":8080",
+		"POSTGRESQL_SSE_PATH":       "/sse",
+		"POSTGRESQL_SSE_URL":        "http://localhost:8080/sse",
 	}
 	order := []string{
 		"POSTGRESQL_HOST",
@@ -185,6 +189,10 @@ func writeDemoEnv(host, port string) error {
 		"POSTGRESQL_PASSWORD",
 		"POSTGRESQL_SSLMODE",
 		"POSTGRESQL_ACCESS_LEVEL",
+		"POSTGRESQL_TRANSPORT",
+		"POSTGRESQL_HTTP_ADDR",
+		"POSTGRESQL_SSE_PATH",
+		"POSTGRESQL_SSE_URL",
 		"POSTGRESQL_MCP_SERVER_DIR",
 	}
 
@@ -261,6 +269,7 @@ func printInstructions(host, port string) {
 	fmt.Printf("POSTGRESQL_PASSWORD=%s\n", password)
 	fmt.Println("POSTGRESQL_SSLMODE=disable")
 	fmt.Println("POSTGRESQL_ACCESS_LEVEL=READONLY")
+	fmt.Println("POSTGRESQL_TRANSPORT=stdio")
 	fmt.Println()
 	fmt.Println("Example MCP server config:")
 	fmt.Println(`{
@@ -280,6 +289,11 @@ func printInstructions(host, port string) {
     }
   }
 }`)
+	fmt.Println()
+	fmt.Println("SSE option:")
+	fmt.Println("Run the MCP server separately with:")
+	fmt.Println(`POSTGRESQL_TRANSPORT=sse POSTGRESQL_HTTP_ADDR=:8080 POSTGRESQL_SSE_PATH=/sse go run ./cmd/postgresql-mcp`)
+	fmt.Println("Then point an SSE-capable MCP client at http://localhost:8080/sse.")
 	fmt.Println()
 	fmt.Println("Agent prompt:")
 	fmt.Println(`You are an operations detective for Northwind Relay. Use the postgresql-northwind-relay MCP server to inspect the schema and data. Build a concise findings report that identifies the most important operational, financial, and data-quality risks. Include the SQL evidence behind each finding and recommend the next three actions.`)
