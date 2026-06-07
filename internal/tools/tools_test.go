@@ -2,6 +2,7 @@ package tools
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"postgresql-mcp/internal/config"
@@ -41,6 +42,15 @@ func TestToolNamesForLevel(t *testing.T) {
 		got := ToolNamesForLevel(tt.level)
 		if !reflect.DeepEqual(got, tt.want) {
 			t.Fatalf("ToolNamesForLevel(%s) = %#v, want %#v", tt.level, got, tt.want)
+		}
+	}
+}
+
+func TestToolDescriptionsForAllTools(t *testing.T) {
+	for _, name := range ToolNamesForLevel(config.DDLRW) {
+		tool := (&Registry{}).tool(name)
+		if strings.TrimSpace(tool.Description) == "" {
+			t.Fatalf("tool %q has no description", name)
 		}
 	}
 }
