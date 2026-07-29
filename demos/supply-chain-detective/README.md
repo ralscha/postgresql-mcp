@@ -38,17 +38,17 @@ go run ./client
 
 The client loads `.env`, starts `go run ./cmd/postgresql-mcp` over stdio by default, exposes the MCP tools to Eino, and asks an Eino `ChatModelAgent` to produce the findings report. It answers all of the questions below through model-selected MCP tool calls rather than querying PostgreSQL directly.
 
-To use SSE for the demo client, start the MCP server separately from the repository root:
+To use stateless Streamable HTTP for the demo client, start the MCP server separately from the repository root:
 
 ```bash
-POSTGRESQL_TRANSPORT=sse POSTGRESQL_HTTP_ADDR=:8080 POSTGRESQL_SSE_PATH=/sse go run ./cmd/postgresql-mcp
+POSTGRESQL_TRANSPORT=http POSTGRESQL_HTTP_ADDR=:8080 POSTGRESQL_HTTP_PATH=/mcp go run ./cmd/postgresql-mcp
 ```
 
 Then set these values in `demos/supply-chain-detective/.env` before running `go run ./client`:
 
 ```text
-POSTGRESQL_TRANSPORT=sse
-POSTGRESQL_SSE_URL=http://localhost:8080/sse
+POSTGRESQL_TRANSPORT=http
+POSTGRESQL_HTTP_URL=http://localhost:8080/mcp
 ```
 
 The client prints a transcript as it runs: the user prompt, available MCP tools, assistant tool calls, MCP tool results, token usage metadata when available, and the final answer.

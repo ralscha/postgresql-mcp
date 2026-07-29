@@ -96,7 +96,7 @@ func ensureEnv() error {
 	defaultEnv("POSTGRESQL_ACCESS_LEVEL", "READONLY")
 	defaultEnv("POSTGRESQL_TRANSPORT", "stdio")
 	defaultEnv("POSTGRESQL_HTTP_ADDR", ":8080")
-	defaultEnv("POSTGRESQL_SSE_PATH", "/sse")
+	defaultEnv("POSTGRESQL_HTTP_PATH", "/mcp")
 	defaultEnv("OPENAI_MODEL", "gpt-4o-mini")
 	return nil
 }
@@ -105,17 +105,17 @@ func connectMCP(ctx context.Context) (*client.Client, error) {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("POSTGRESQL_TRANSPORT"))) {
 	case "", "stdio":
 		return connectStdioMCP(ctx)
-	case "sse":
-		return connectSSEMCP(ctx)
+	case "http":
+		return connectHTTPMCP(ctx)
 	default:
-		return nil, fmt.Errorf("unsupported POSTGRESQL_TRANSPORT %q, expected stdio or sse", os.Getenv("POSTGRESQL_TRANSPORT"))
+		return nil, fmt.Errorf("unsupported POSTGRESQL_TRANSPORT %q, expected stdio or http", os.Getenv("POSTGRESQL_TRANSPORT"))
 	}
 }
 
 func printMCPConnection() {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("POSTGRESQL_TRANSPORT"))) {
-	case "sse":
-		fmt.Printf("Connecting to postgresql-mcp over SSE at %q for database %q.\n", sseEndpoint(), os.Getenv("POSTGRESQL_DATABASE"))
+	case "http":
+		fmt.Printf("Connecting to postgresql-mcp over Streamable HTTP at %q for database %q.\n", httpEndpoint(), os.Getenv("POSTGRESQL_DATABASE"))
 	default:
 		fmt.Printf("Connecting to postgresql-mcp over stdio in %q for database %q.\n", serverDir(), os.Getenv("POSTGRESQL_DATABASE"))
 	}
@@ -161,15 +161,15 @@ func connectStdioMCP(ctx context.Context) (*client.Client, error) {
 	return c, nil
 }
 
-func connectSSEMCP(ctx context.Context) (*client.Client, error) {
-	endpoint := sseEndpoint()
-	c, err := client.NewSSEMCPClient(endpoint)
+func connectHTTPMCP(ctx context.Context) (*client.Client, error) {
+	endpoint := httpEndpoint()
+	c, err := client.NewStreamableHttpClient(endpoint)
 	if err != nil {
 		return nil, err
 	}
 	if err := c.Start(ctx); err != nil {
 		_ = c.Close()
-		return nil, fmt.Errorf("start SSE MCP client for %s: %w", endpoint, err)
+		return nil, fmt.Errorf("start Streamable HTTP MCP client for %s: %w", endpoint, err)
 	}
 
 	initRequest := mcp.InitializeRequest{}
@@ -187,8 +187,8 @@ func connectSSEMCP(ctx context.Context) (*client.Client, error) {
 	return c, nil
 }
 
-func sseEndpoint() string {
-	if endpoint := strings.TrimSpace(os.Getenv("POSTGRESQL_SSE_URL")); endpoint != "" {
+func httpEndpoint() string {
+	if endpoint := strings.TrimSpace(os.Getenv("POSTGRESQL_HTTP_URL")); endpoint != "" {
 		return endpoint
 	}
 
@@ -196,9 +196,9 @@ func sseEndpoint() string {
 	if addr == "" {
 		addr = ":8080"
 	}
-	path := strings.TrimSpace(os.Getenv("POSTGRESQL_SSE_PATH"))
+	path := strings.TrimSpace(os.Getenv("POSTGRESQL_HTTP_PATH"))
 	if path == "" {
-		path = "/sse"
+		path = "/mcp"
 	}
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path

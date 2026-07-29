@@ -34,9 +34,9 @@ Download the latest release for your platform from the [Releases](https://github
 | `POSTGRESQL_QUERY_TIMEOUT` | No | `120` | Query timeout in seconds |
 | `POSTGRESQL_MAX_ROWS_DEFAULT` | No | `1000` | Default row limit for queries |
 | `POSTGRESQL_REQUIRE_CONFIRMATION` | No | `true` | Require confirm flag for writes |
-| `POSTGRESQL_TRANSPORT` | No | `stdio` | MCP transport: `stdio` or `sse` |
-| `POSTGRESQL_HTTP_ADDR` | No | `:8080` | HTTP listen address when `POSTGRESQL_TRANSPORT=sse` |
-| `POSTGRESQL_SSE_PATH` | No | `/sse` | SSE endpoint path when `POSTGRESQL_TRANSPORT=sse` |
+| `POSTGRESQL_TRANSPORT` | No | `stdio` | MCP transport: `stdio` or `http` |
+| `POSTGRESQL_HTTP_ADDR` | No | `:8080` | HTTP listen address when `POSTGRESQL_TRANSPORT=http` |
+| `POSTGRESQL_HTTP_PATH` | No | `/mcp` | Stateless Streamable HTTP endpoint path when `POSTGRESQL_TRANSPORT=http` |
 
 ### Running as an MCP Server
 
@@ -60,19 +60,19 @@ By default, the server communicates over stdio. Configure your MCP client to lau
 }
 ```
 
-To serve MCP over SSE instead, set `POSTGRESQL_TRANSPORT=sse` and run the server as an HTTP process:
+To serve MCP using the stateless Streamable HTTP transport, set `POSTGRESQL_TRANSPORT=http`:
 
 ```bash
-POSTGRESQL_TRANSPORT=sse \
+POSTGRESQL_TRANSPORT=http \
 POSTGRESQL_HTTP_ADDR=:8080 \
-POSTGRESQL_SSE_PATH=/sse \
+POSTGRESQL_HTTP_PATH=/mcp \
 /path/to/bin/postgresql-mcp
 ```
 
-Then configure an SSE-capable MCP client to connect to:
+Then configure a Streamable HTTP MCP client to connect to:
 
 ```text
-http://localhost:8080/sse
+http://localhost:8080/mcp
 ```
 
 ### Access Levels

@@ -36,8 +36,9 @@ func TestParseTransport(t *testing.T) {
 	}{
 		{"", StdioTransport, true},
 		{"stdio", StdioTransport, true},
-		{"SSE", SSETransport, true},
-		{"http", "", false},
+		{"HTTP", HTTPTransport, true},
+		{"sse", "", false},
+		{"websocket", "", false},
 	}
 	for _, tt := range tests {
 		got, err := ParseTransport(tt.in)
@@ -92,17 +93,17 @@ func TestValidateTransportConfig(t *testing.T) {
 		ConnectionTimeout:   1,
 		QueryTimeout:        1,
 		MaxRowsDefault:      1,
-		Transport:           SSETransport,
+		Transport:           HTTPTransport,
 		HTTPAddr:            ":8080",
-		SSEPath:             "/sse",
+		HTTPPath:            "/mcp",
 		RequireConfirmation: true,
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() unexpected error: %v", err)
 	}
 
-	cfg.SSEPath = "sse"
+	cfg.HTTPPath = "mcp"
 	if err := cfg.Validate(); err == nil {
-		t.Fatal("Validate() expected error for SSE path without leading slash")
+		t.Fatal("Validate() expected error for HTTP path without leading slash")
 	}
 }
