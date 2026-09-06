@@ -3,7 +3,10 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"postgresql-mcp/internal/config"
@@ -57,10 +60,41 @@ func (c *Client) QueryReadOnly(ctx context.Context, query string, maxRows int) (
 	if maxRows <= 0 || maxRows > c.Config.MaxRowsDefault {
 		maxRows = c.Config.MaxRowsDefault
 	}
-	if sqlsafe.NeedsRowLimit(query) {
-		query = sqlsafe.AppendLimit(query, maxRows)
+	return c.queryInReadOnlyTransaction(ctx, sqlsafe.AppendLimit(query, maxRows))
+}
+
+func (c *Client) ExplainReadOnly(ctx context.Context, query string) ([]map[string]any, error) {
+	if !sqlsafe.IsReadOnlyQuery(query) {
+		return nil, fmt.Errorf("only read-only SELECT queries can be explained")
 	}
-	return c.Query(ctx, query)
+	return c.queryInReadOnlyTransaction(ctx, "EXPLAIN (FORMAT JSON) "+query)
+}
+
+func (c *Client) queryInReadOnlyTransaction(ctx context.Context, query string, args ...any) ([]map[string]any, error) {
+	tx, err := c.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin read-only transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	result, err := ScanRows(rows)
+	closeErr := rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit read-only transaction: %w", err)
+	}
+	return result, nil
 }
 
 func (c *Client) Exec(ctx context.Context, query string, args ...any) (int64, error) {
@@ -80,6 +114,11 @@ func ScanRows(rows *sql.Rows) ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	columnTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, err
+	}
+	cols = uniqueColumnNames(cols)
 	out := []map[string]any{}
 	for rows.Next() {
 		raw := make([]any, len(cols))
@@ -92,18 +131,27 @@ func ScanRows(rows *sql.Rows) ([]map[string]any, error) {
 		}
 		row := make(map[string]any, len(cols))
 		for i, col := range cols {
-			row[col] = normalize(raw[i])
+			row[col] = normalize(raw[i], columnTypes[i].DatabaseTypeName())
 		}
 		out = append(out, row)
 	}
 	return out, rows.Err()
 }
 
-func normalize(v any) any {
+func normalize(v any, databaseType string) any {
 	switch x := v.(type) {
 	case nil:
 		return nil
 	case []byte:
+		switch strings.ToUpper(databaseType) {
+		case "BYTEA":
+			return base64.StdEncoding.EncodeToString(x)
+		case "JSON", "JSONB":
+			var decoded any
+			if json.Unmarshal(x, &decoded) == nil {
+				return decoded
+			}
+		}
 		return string(x)
 	case time.Time:
 		return x.Format(time.RFC3339Nano)
@@ -112,6 +160,33 @@ func normalize(v any) any {
 	default:
 		return x
 	}
+}
+
+func uniqueColumnNames(columns []string) []string {
+	names := make([]string, len(columns))
+	used := make(map[string]bool, len(columns))
+	original := make(map[string]bool, len(columns))
+	next := make(map[string]int, len(columns))
+	for _, column := range columns {
+		original[column] = true
+	}
+	for i, column := range columns {
+		name := column
+		if used[name] {
+			if next[column] < 2 {
+				next[column] = 2
+			}
+			name = fmt.Sprintf("%s_%d", column, next[column])
+			for used[name] || original[name] {
+				next[column]++
+				name = fmt.Sprintf("%s_%d", column, next[column])
+			}
+			next[column]++
+		}
+		names[i] = name
+		used[name] = true
+	}
+	return names
 }
 
 func fmtUUID(b []byte) string {

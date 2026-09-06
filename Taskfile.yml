@@ -10,10 +10,14 @@ tasks:
   format:
     desc: Format all Go source files
     cmds:
-      - go fix ./...
       - go fmt ./...
-      - cd demos/supply-chain-detective && go fix ./...
       - cd demos/supply-chain-detective && go fmt ./...
+
+  fix:
+    desc: Apply Go's source-code fixers
+    cmds:
+      - go fix ./...
+      - cd demos/supply-chain-detective && go fix ./...
 
   build:
     desc: Build the PostgreSQL MCP server
@@ -29,7 +33,7 @@ tasks:
   lint:
     desc: Run golangci-lint in a Docker container
     cmds:
-      - golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app golangci/golangci-lint:v2.13.2 golangci-lint run -v --timeout 5m
       - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/demos/supply-chain-detective golangci/golangci-lint:v2.13.2 golangci-lint run -v --timeout 5m
 
   demo:

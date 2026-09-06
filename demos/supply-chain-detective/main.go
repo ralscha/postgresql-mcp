@@ -177,7 +177,7 @@ func writeDemoEnv(host, port string) error {
 	defaults := map[string]string{
 		"POSTGRESQL_MCP_SERVER_DIR": "../..",
 		"POSTGRESQL_TRANSPORT":      "stdio",
-		"POSTGRESQL_HTTP_ADDR":      ":8080",
+		"POSTGRESQL_HTTP_ADDR":      "127.0.0.1:8080",
 		"POSTGRESQL_HTTP_PATH":      "/mcp",
 		"POSTGRESQL_HTTP_URL":       "http://localhost:8080/mcp",
 	}
@@ -292,7 +292,7 @@ func printInstructions(host, port string) {
 	fmt.Println()
 	fmt.Println("Streamable HTTP option:")
 	fmt.Println("Run the MCP server separately with:")
-	fmt.Println(`POSTGRESQL_TRANSPORT=http POSTGRESQL_HTTP_ADDR=:8080 POSTGRESQL_HTTP_PATH=/mcp go run ./cmd/postgresql-mcp`)
+	fmt.Println(`POSTGRESQL_TRANSPORT=http POSTGRESQL_HTTP_ADDR=127.0.0.1:8080 POSTGRESQL_HTTP_PATH=/mcp go run ./cmd/postgresql-mcp`)
 	fmt.Println("Then point a Streamable HTTP MCP client at http://localhost:8080/mcp.")
 	fmt.Println()
 	fmt.Println("Agent prompt:")

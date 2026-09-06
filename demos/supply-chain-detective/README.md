@@ -41,7 +41,7 @@ The client loads `.env`, starts `go run ./cmd/postgresql-mcp` over stdio by defa
 To use stateless Streamable HTTP for the demo client, start the MCP server separately from the repository root:
 
 ```bash
-POSTGRESQL_TRANSPORT=http POSTGRESQL_HTTP_ADDR=:8080 POSTGRESQL_HTTP_PATH=/mcp go run ./cmd/postgresql-mcp
+POSTGRESQL_TRANSPORT=http POSTGRESQL_HTTP_ADDR=127.0.0.1:8080 POSTGRESQL_HTTP_PATH=/mcp go run ./cmd/postgresql-mcp
 ```
 
 Then set these values in `demos/supply-chain-detective/.env` before running `go run ./client`:
@@ -50,6 +50,8 @@ Then set these values in `demos/supply-chain-detective/.env` before running `go 
 POSTGRESQL_TRANSPORT=http
 POSTGRESQL_HTTP_URL=http://localhost:8080/mcp
 ```
+
+If the server sets `POSTGRESQL_HTTP_BEARER_TOKEN`, set the same variable for the demo client; it sends the corresponding `Authorization` header.
 
 The client prints a transcript as it runs: the user prompt, available MCP tools, assistant tool calls, MCP tool results, token usage metadata when available, and the final answer.
 

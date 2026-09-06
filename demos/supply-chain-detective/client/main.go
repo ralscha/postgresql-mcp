@@ -75,13 +75,15 @@ func loadEnv() {
 }
 
 func ensureEnv() error {
-	required := []string{
-		"OPENAI_API_KEY",
-		"POSTGRESQL_HOST",
-		"POSTGRESQL_PORT",
-		"POSTGRESQL_DATABASE",
-		"POSTGRESQL_USER",
-		"POSTGRESQL_PASSWORD",
+	required := []string{"OPENAI_API_KEY"}
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("POSTGRESQL_TRANSPORT")), "http") {
+		required = append(required,
+			"POSTGRESQL_HOST",
+			"POSTGRESQL_PORT",
+			"POSTGRESQL_DATABASE",
+			"POSTGRESQL_USER",
+			"POSTGRESQL_PASSWORD",
+		)
 	}
 	var missing []string
 	for _, name := range required {
@@ -95,7 +97,7 @@ func ensureEnv() error {
 	defaultEnv("POSTGRESQL_SSLMODE", "disable")
 	defaultEnv("POSTGRESQL_ACCESS_LEVEL", "READONLY")
 	defaultEnv("POSTGRESQL_TRANSPORT", "stdio")
-	defaultEnv("POSTGRESQL_HTTP_ADDR", ":8080")
+	defaultEnv("POSTGRESQL_HTTP_ADDR", "127.0.0.1:8080")
 	defaultEnv("POSTGRESQL_HTTP_PATH", "/mcp")
 	defaultEnv("OPENAI_MODEL", "gpt-4o-mini")
 	return nil
@@ -129,7 +131,7 @@ func connectStdioMCP(ctx context.Context) (*client.Client, error) {
 		transport.WithCommandFunc(func(ctx context.Context, _ string, env []string, _ []string) (*exec.Cmd, error) {
 			cmd := exec.CommandContext(ctx, "go", "run", "./cmd/postgresql-mcp")
 			cmd.Dir = serverDir()
-			cmd.Env = append(os.Environ(), env...)
+			cmd.Env = env
 			return cmd, nil
 		}),
 	)
@@ -163,7 +165,11 @@ func connectStdioMCP(ctx context.Context) (*client.Client, error) {
 
 func connectHTTPMCP(ctx context.Context) (*client.Client, error) {
 	endpoint := httpEndpoint()
-	c, err := client.NewStreamableHttpClient(endpoint)
+	var options []transport.StreamableHTTPCOption
+	if token := os.Getenv("POSTGRESQL_HTTP_BEARER_TOKEN"); token != "" {
+		options = append(options, transport.WithHTTPHeaders(map[string]string{"Authorization": "Bearer " + token}))
+	}
+	c, err := client.NewStreamableHttpClient(endpoint, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +200,7 @@ func httpEndpoint() string {
 
 	addr := strings.TrimSpace(os.Getenv("POSTGRESQL_HTTP_ADDR"))
 	if addr == "" {
-		addr = ":8080"
+		addr = "127.0.0.1:8080"
 	}
 	path := strings.TrimSpace(os.Getenv("POSTGRESQL_HTTP_PATH"))
 	if path == "" {

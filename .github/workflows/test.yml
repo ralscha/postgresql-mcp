@@ -4,13 +4,15 @@ on:
   push:
     paths:
       - '**/*.go'
-      - go.mod
-      - go.sum
+      - '**/go.mod'
+      - '**/go.sum'
+      - '.github/workflows/test.yml'
   pull_request:
     paths:
       - '**/*.go'
-      - go.mod
-      - go.sum
+      - '**/go.mod'
+      - '**/go.sum'
+      - '.github/workflows/test.yml'
 
 permissions:
   contents: read
@@ -19,6 +21,19 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Check out repository
@@ -29,5 +44,23 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run Go tests
+      - name: Test server
         run: go test ./...
+        env:
+          POSTGRESQL_INTEGRATION_TEST: '1'
+          POSTGRESQL_HOST: 127.0.0.1
+          POSTGRESQL_DATABASE: postgres
+          POSTGRESQL_USER: postgres
+          POSTGRESQL_PASSWORD: postgres
+          POSTGRESQL_SSLMODE: disable
+
+      - name: Vet server
+        run: go vet ./...
+
+      - name: Test demo
+        working-directory: demos/supply-chain-detective
+        run: go test ./...
+
+      - name: Vet demo
+        working-directory: demos/supply-chain-detective
+        run: go vet ./...

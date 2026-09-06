@@ -10,7 +10,7 @@ func TestQuoteMultipart(t *testing.T) {
 	if got != `"public"."Users"` {
 		t.Fatalf("got %q", got)
 	}
-	// Single part
+
 	got, err = QuoteMultipart("Users")
 	if err != nil {
 		t.Fatal(err)
@@ -18,7 +18,8 @@ func TestQuoteMultipart(t *testing.T) {
 	if got != `"Users"` {
 		t.Fatalf("got %q", got)
 	}
-	bad := []string{"", "public.", "public.Users;DROP", "public.\"Users\"", "a.b.c", "with space"}
+
+	bad := []string{"", "public.", "public.Users;DROP", `public."Users"`, "a.b.c", "with space"}
 	for _, name := range bad {
 		if _, err := QuoteMultipart(name); err == nil {
 			t.Fatalf("QuoteMultipart(%q) expected error", name)
@@ -32,12 +33,17 @@ func TestIsReadOnlyQuery(t *testing.T) {
 		"WITH cte AS (SELECT 1 AS n) SELECT * FROM cte",
 		"-- comment\nSELECT 1",
 		"/* comment */ SELECT 1",
+		"SELECT 'UPDATE t SET value = 1; DROP TABLE t' AS example",
+		`SELECT "DELETE", $$ INSERT; UPDATE $$`,
+		"SELECT 1; -- a trailing comment is part of the same statement",
+		"/* nested /* block */ comment */ SELECT 1",
 	}
-	for _, q := range yes {
-		if !IsReadOnlyQuery(q) {
-			t.Fatalf("expected read-only: %q", q)
+	for _, query := range yes {
+		if !IsReadOnlyQuery(query) {
+			t.Errorf("expected read-only: %q", query)
 		}
 	}
+
 	no := []string{
 		"INSERT INTO t VALUES (1)",
 		"UPDATE t SET a = 1",
@@ -53,60 +59,44 @@ func TestIsReadOnlyQuery(t *testing.T) {
 		"DO $$ BEGIN NULL; END $$",
 		"SELECT * FROM t; DROP TABLE t",
 		"SELECT 1; SELECT 2",
+		"WITH changed AS (DELETE FROM t RETURNING *) SELECT * FROM changed",
+		"SELECT 'unterminated",
+		"/* unterminated SELECT 1",
 	}
-	for _, q := range no {
-		if IsReadOnlyQuery(q) {
-			t.Fatalf("expected not read-only: %q", q)
+	for _, query := range no {
+		if IsReadOnlyQuery(query) {
+			t.Errorf("expected not read-only: %q", query)
 		}
-	}
-}
-
-func TestRowLimit(t *testing.T) {
-	if !NeedsRowLimit("SELECT * FROM t") {
-		t.Fatal("plain select should need row limit")
-	}
-	if NeedsRowLimit("SELECT * FROM t LIMIT 10") {
-		t.Fatal("LIMIT select should not need row limit")
-	}
-	if NeedsRowLimit("SELECT * FROM t FETCH FIRST 10 ROWS ONLY") {
-		t.Fatal("FETCH FIRST select should not need row limit")
-	}
-	if NeedsRowLimit("SELECT * FROM t FETCH NEXT 50 ROW ONLY") {
-		t.Fatal("FETCH NEXT select should not need row limit")
 	}
 }
 
 func TestAppendLimit(t *testing.T) {
 	got := AppendLimit("SELECT * FROM t", 25)
-	want := "SELECT * FROM t LIMIT 25"
+	want := "SELECT * FROM (\nSELECT * FROM t\n) AS \"_postgresql_mcp_result\" LIMIT 25"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
-	// Strips trailing semicolon
-	got = AppendLimit("SELECT * FROM t;", 10)
-	want = "SELECT * FROM t LIMIT 10"
+
+	// The outer limit is authoritative even if the query already has a larger one.
+	got = AppendLimit("SELECT * FROM t LIMIT 10000; -- trailing", 10)
+	want = "SELECT * FROM (\nSELECT * FROM t LIMIT 10000\n) AS \"_postgresql_mcp_result\" LIMIT 10"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
 func TestLikePattern(t *testing.T) {
-	got := LikePattern("acme")
-	if len(got) != 6 || got[0] != '%' || got[5] != '%' {
-		t.Fatalf("got %q (len=%d, bytes=%v)", got, len(got), []byte(got))
+	tests := map[string]string{
+		"acme":  "%acme%",
+		"*acme": "%acme",
+		"acme*": "acme%",
+		"acme%": `%acme\%%`,
+		"a_b":   `%a\_b%`,
+		`a\b`:   `%a\\b%`,
 	}
-	// * is a wildcard that maps to % — no additional wrapping
-	got = LikePattern("*acme")
-	if got != "%acme" {
-		t.Fatalf("got %q", got)
-	}
-	// Already has % so no wrapping
-	got = LikePattern("acme%")
-	if len(got) < 5 {
-		t.Fatalf("got %q (len=%d, bytes=%v)", got, len(got), []byte(got))
-	}
-	// "acme%" should become "acme\%" — has wildcard, so no wrapping
-	if got[len(got)-1] != '%' {
-		t.Fatalf("expected trailing %%, got %q (bytes=%v)", got, []byte(got))
+	for input, want := range tests {
+		if got := LikePattern(input); got != want {
+			t.Errorf("LikePattern(%q) = %q, want %q", input, got, want)
+		}
 	}
 }

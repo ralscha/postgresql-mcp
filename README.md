@@ -6,12 +6,13 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that 
 
 - **24 MCP tools** covering schema search, table description, data profiling, relationship/dependency inspection, query explanation, connection testing, schema/extension/view/trigger listing, CREATE TABLE DDL generation, table sizing, and tiered write access
 - **Tiered access model** via `POSTGRESQL_ACCESS_LEVEL`: `READONLY` (default), `DML-RW` (adds insert/update/delete), `DDL-RW` (adds create/drop table/index)
-- **SQL-safe design** with double-quote identifier quoting, multipart name validation, and read-only query enforcement
-- **Read-only query guard** that rejects mutating statements (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `COPY`, `VACUUM`, etc.) on the `read_data` tool
+- **SQL-safe design** with identifier validation, exact named-parameter binding, single-statement checks, and database-enforced read-only transactions
+- **Authoritative row limits** that cap `read_data` results even when the submitted query contains its own larger `LIMIT`
 - **Mutation confirmation** with preview mode that shows affected rows before executing writes when `POSTGRESQL_REQUIRE_CONFIRMATION` is enabled
 - **Explain plan** via `EXPLAIN (FORMAT JSON)` for understanding query performance
 - **Connection testing** that validates connectivity and reports latency
 - **Environment listing** showing current host, database, and access-level configuration
+- **Optional HTTP bearer authentication**, same-origin protection, request-size limits, and graceful shutdown
 
 ## Installation
 
@@ -35,8 +36,9 @@ Download the latest release for your platform from the [Releases](https://github
 | `POSTGRESQL_MAX_ROWS_DEFAULT` | No | `1000` | Default row limit for queries |
 | `POSTGRESQL_REQUIRE_CONFIRMATION` | No | `true` | Require confirm flag for writes |
 | `POSTGRESQL_TRANSPORT` | No | `stdio` | MCP transport: `stdio` or `http` |
-| `POSTGRESQL_HTTP_ADDR` | No | `:8080` | HTTP listen address when `POSTGRESQL_TRANSPORT=http` |
+| `POSTGRESQL_HTTP_ADDR` | No | `127.0.0.1:8080` | HTTP listen address when `POSTGRESQL_TRANSPORT=http` |
 | `POSTGRESQL_HTTP_PATH` | No | `/mcp` | Stateless Streamable HTTP endpoint path when `POSTGRESQL_TRANSPORT=http` |
+| `POSTGRESQL_HTTP_BEARER_TOKEN` | No | — | Require `Authorization: Bearer <token>` for HTTP requests |
 
 ### Running as an MCP Server
 
@@ -64,7 +66,7 @@ To serve MCP using the stateless Streamable HTTP transport, set `POSTGRESQL_TRAN
 
 ```bash
 POSTGRESQL_TRANSPORT=http \
-POSTGRESQL_HTTP_ADDR=:8080 \
+POSTGRESQL_HTTP_ADDR=127.0.0.1:8080 \
 POSTGRESQL_HTTP_PATH=/mcp \
 /path/to/bin/postgresql-mcp
 ```
@@ -75,6 +77,8 @@ Then configure a Streamable HTTP MCP client to connect to:
 http://localhost:8080/mcp
 ```
 
+Set `POSTGRESQL_HTTP_BEARER_TOKEN` when the endpoint is reachable by anything other than a trusted local client. Binding to a non-loopback address without authentication exposes every tool allowed by `POSTGRESQL_ACCESS_LEVEL`.
+
 ### Access Levels
 
 - **`READONLY`** (default) — Schema exploration, data reading, profiling, relationship inspection, query explanation, connection testing, schema listing, extensions, views, triggers, CREATE TABLE DDL generation, table sizing. 18 tools.
@@ -82,6 +86,10 @@ http://localhost:8080/mcp
 - **`DDL-RW`** — All DML tools plus `create_table`, `create_index`, `drop_table`. 24 tools.
 
 Mutations (`update_data`, `delete_data`, `drop_table`) require a `"confirm": true` flag when `POSTGRESQL_REQUIRE_CONFIRMATION` is enabled (the default). Without confirmation, the server returns a preview of the affected rows instead.
+
+`update_data` and `delete_data` predicates use named placeholders. For example, use `"where": "id = $id AND tenant = $tenant"` with `"params": {"id": 42, "tenant": "acme"}`. Every placeholder must have a value and every supplied parameter must be used.
+
+Query results decode `json`/`jsonb` into structured JSON, encode `bytea` as base64, and suffix duplicate column names (`id`, `id_2`, and so on) so joined results do not silently lose values.
 
 ## MCP Tools
 
@@ -94,7 +102,7 @@ Mutations (`update_data`, `delete_data`, `drop_table`) require a `"confirm": tru
 | `list_table` | List tables, optionally filtered by schema and name |
 | `list_databases` | List all databases on the server |
 | `list_environments` | Show current connection and access-level configuration |
-| `profile_table` | Row count, null counts, distinct counts, min/max per column, with optional data samples |
+| `profile_table` | Row count, null counts, distinct counts, min/max when supported, with optional data samples |
 | `inspect_relationships` | List foreign keys going out of and into a table |
 | `inspect_dependencies` | Find objects (views, functions) that depend on a table |
 | `explain_query` | Get the JSON execution plan for a read-only query |
@@ -105,8 +113,8 @@ Mutations (`update_data`, `delete_data`, `drop_table`) require a `"confirm": tru
 | `list_extensions` | List installed PostgreSQL extensions with version |
 | `list_views` | List views with their SQL definitions |
 | `list_triggers` | List triggers with event, timing, and definition |
-| `show_create_table` | Generate the CREATE TABLE DDL for an existing table |
-| `table_size` | Table and index sizes, toast size, estimated row counts |
+| `show_create_table` | Generate CREATE TABLE DDL including defaults, generated/identity columns, and table constraints |
+| `table_size` | Table and index sizes, toast size, and estimated row counts, optionally for one table |
 
 ### DML (DML-RW)
 

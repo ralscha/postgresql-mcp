@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -36,6 +37,7 @@ type Config struct {
 	Transport           Transport
 	HTTPAddr            string
 	HTTPPath            string
+	HTTPBearerToken     string
 }
 
 var validSSLModes = map[string]bool{
@@ -92,21 +94,42 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	port, err := intEnv("POSTGRESQL_PORT", 5432)
+	if err != nil {
+		return Config{}, err
+	}
+	connectionTimeout, err := durationSecondsEnv("POSTGRESQL_CONNECTION_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	queryTimeout, err := durationSecondsEnv("POSTGRESQL_QUERY_TIMEOUT", 120*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	maxRows, err := intEnv("POSTGRESQL_MAX_ROWS_DEFAULT", 1000)
+	if err != nil {
+		return Config{}, err
+	}
+	requireConfirmation, err := boolEnv("POSTGRESQL_REQUIRE_CONFIRMATION", true)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		AccessLevel:         level,
 		Host:                os.Getenv("POSTGRESQL_HOST"),
 		Database:            os.Getenv("POSTGRESQL_DATABASE"),
 		User:                os.Getenv("POSTGRESQL_USER"),
 		Password:            os.Getenv("POSTGRESQL_PASSWORD"),
-		Port:                intEnv("POSTGRESQL_PORT", 5432),
-		SSLMode:             stringEnv("POSTGRESQL_SSLMODE", "prefer"),
-		ConnectionTimeout:   durationSecondsEnv("POSTGRESQL_CONNECTION_TIMEOUT", 30*time.Second),
-		QueryTimeout:        durationSecondsEnv("POSTGRESQL_QUERY_TIMEOUT", 120*time.Second),
-		MaxRowsDefault:      intEnv("POSTGRESQL_MAX_ROWS_DEFAULT", 1000),
-		RequireConfirmation: boolEnv("POSTGRESQL_REQUIRE_CONFIRMATION", true),
+		Port:                port,
+		SSLMode:             strings.ToLower(stringEnv("POSTGRESQL_SSLMODE", "prefer")),
+		ConnectionTimeout:   connectionTimeout,
+		QueryTimeout:        queryTimeout,
+		MaxRowsDefault:      maxRows,
+		RequireConfirmation: requireConfirmation,
 		Transport:           transport,
-		HTTPAddr:            stringEnv("POSTGRESQL_HTTP_ADDR", ":8080"),
+		HTTPAddr:            stringEnv("POSTGRESQL_HTTP_ADDR", "127.0.0.1:8080"),
 		HTTPPath:            stringEnv("POSTGRESQL_HTTP_PATH", "/mcp"),
+		HTTPBearerToken:     os.Getenv("POSTGRESQL_HTTP_BEARER_TOKEN"),
 	}
 	return cfg, cfg.Validate()
 }
@@ -142,21 +165,32 @@ func (c Config) Validate() error {
 	if c.Transport != StdioTransport && c.Transport != HTTPTransport {
 		return fmt.Errorf("POSTGRESQL_TRANSPORT must be stdio or http")
 	}
-	if c.HTTPAddr == "" {
-		return fmt.Errorf("POSTGRESQL_HTTP_ADDR is required")
-	}
-	if c.Transport == HTTPTransport && !strings.HasPrefix(c.HTTPPath, "/") {
-		return fmt.Errorf("POSTGRESQL_HTTP_PATH must start with /")
+	if c.Transport == HTTPTransport {
+		if c.HTTPAddr == "" {
+			return fmt.Errorf("POSTGRESQL_HTTP_ADDR is required")
+		}
+		if _, _, err := net.SplitHostPort(c.HTTPAddr); err != nil {
+			return fmt.Errorf("invalid POSTGRESQL_HTTP_ADDR %q: %w", c.HTTPAddr, err)
+		}
+		if c.HTTPPath == "" || !strings.HasPrefix(c.HTTPPath, "/") ||
+			strings.TrimSpace(c.HTTPPath) != c.HTTPPath || strings.ContainsAny(c.HTTPPath, "?#{}") {
+			return fmt.Errorf("POSTGRESQL_HTTP_PATH must be an absolute path without whitespace, query, fragment, or wildcard syntax")
+		}
 	}
 	return nil
 }
 
 func (c Config) ConnectionString() string {
+	host := c.Host
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	}
 	u := &url.URL{
-		Scheme: "postgres",
-		User:   url.UserPassword(c.User, c.Password),
-		Host:   fmt.Sprintf("%s:%d", c.Host, c.Port),
-		Path:   c.Database,
+		Scheme:  "postgres",
+		User:    url.UserPassword(c.User, c.Password),
+		Host:    net.JoinHostPort(host, strconv.Itoa(c.Port)),
+		Path:    "/" + c.Database,
+		RawPath: "/" + url.PathEscape(c.Database),
 	}
 	q := u.Query()
 	q.Set("sslmode", c.SSLMode)
@@ -181,16 +215,19 @@ func (c Config) PublicSummary() map[string]any {
 		"transport":            c.Transport,
 		"httpAddr":             c.HTTPAddr,
 		"httpPath":             c.HTTPPath,
+		"httpBearerConfigured": c.HTTPBearerToken != "",
 	}
 }
 
-func intEnv(name string, fallback int) int {
+func intEnv(name string, fallback int) (int, error) {
 	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("%s must be an integer, got %q", name, v)
 		}
+		return n, nil
 	}
-	return fallback
+	return fallback, nil
 }
 
 func stringEnv(name string, fallback string) string {
@@ -200,15 +237,25 @@ func stringEnv(name string, fallback string) string {
 	return fallback
 }
 
-func boolEnv(name string, fallback bool) bool {
+func boolEnv(name string, fallback bool) (bool, error) {
 	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return false, fmt.Errorf("%s must be a boolean, got %q", name, v)
 		}
+		return b, nil
 	}
-	return fallback
+	return fallback, nil
 }
 
-func durationSecondsEnv(name string, fallback time.Duration) time.Duration {
-	return time.Duration(intEnv(name, int(fallback.Seconds()))) * time.Second
+func durationSecondsEnv(name string, fallback time.Duration) (time.Duration, error) {
+	seconds, err := intEnv(name, int(fallback.Seconds()))
+	if err != nil {
+		return 0, err
+	}
+	maxSeconds := int((time.Duration(1<<63 - 1)) / time.Second)
+	if seconds > maxSeconds || seconds < -maxSeconds {
+		return 0, fmt.Errorf("%s is too large", name)
+	}
+	return time.Duration(seconds) * time.Second, nil
 }

@@ -6,6 +6,8 @@ builds:
   - id: default
     main: ./cmd/postgresql-mcp
     binary: postgresql-mcp
+    ldflags:
+      - -s -w -X main.version={{.Version}}
     env:
       - CGO_ENABLED=0
     goos:

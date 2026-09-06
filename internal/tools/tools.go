@@ -41,7 +41,27 @@ func ToolNamesForLevel(level config.AccessLevel) []string {
 
 func (r *Registry) tool(name string) *mcp.Tool {
 	r.names = append(r.names, name)
-	return &mcp.Tool{Name: name, Description: toolDescriptions[name]}
+	_, mutating := mutatingTools[name]
+	_, destructive := destructiveTools[name]
+	return &mcp.Tool{
+		Name:        name,
+		Description: toolDescriptions[name],
+		Annotations: &mcp.ToolAnnotations{
+			DestructiveHint: boolPointer(destructive),
+			IdempotentHint:  !mutating,
+			OpenWorldHint:   boolPointer(false),
+			ReadOnlyHint:    !mutating,
+		},
+	}
+}
+
+var mutatingTools = map[string]struct{}{
+	"insert_data": {}, "update_data": {}, "delete_data": {},
+	"create_table": {}, "create_index": {}, "drop_table": {},
+}
+
+var destructiveTools = map[string]struct{}{
+	"update_data": {}, "delete_data": {}, "drop_table": {},
 }
 
 var toolDescriptions = map[string]string{
@@ -111,10 +131,10 @@ type RowsOutput struct {
 // ---- search_schema ----
 
 type SearchSchemaInput struct {
-	Query        string `json:"query"`
-	TableOffset  int    `json:"tableOffset"`
-	ColumnOffset int    `json:"columnOffset"`
-	Limit        int    `json:"limit"`
+	Query        string `json:"query" jsonschema:"Name to find; use * as a wildcard. An empty string lists everything."`
+	TableOffset  int    `json:"tableOffset,omitempty" jsonschema:"Zero-based offset for table results."`
+	ColumnOffset int    `json:"columnOffset,omitempty" jsonschema:"Zero-based offset for column results."`
+	Limit        int    `json:"limit,omitempty" jsonschema:"Maximum results in each group; defaults to 50 and is capped at 200."`
 }
 
 type SearchSchemaOutput struct {
@@ -130,7 +150,10 @@ func (r *Registry) searchSchema(ctx context.Context, _ *mcp.CallToolRequest, in 
 	tables, err := r.client.Query(ctx, `
 SELECT table_schema AS schema, table_name AS table, table_type AS type
 FROM information_schema.tables
-WHERE table_type = 'BASE TABLE' AND (table_schema LIKE $1 ESCAPE '\' OR table_name LIKE $1 ESCAPE '\')
+WHERE table_type = 'BASE TABLE'
+  AND table_schema NOT IN ('information_schema', 'pg_catalog')
+  AND table_schema NOT LIKE 'pg_toast%'
+  AND (table_schema LIKE $1 ESCAPE '\' OR table_name LIKE $1 ESCAPE '\')
 ORDER BY table_schema, table_name
 LIMIT $3 OFFSET $2`, pattern, max(in.TableOffset, 0), limit)
 	if err != nil {
@@ -139,7 +162,9 @@ LIMIT $3 OFFSET $2`, pattern, max(in.TableOffset, 0), limit)
 	columns, err := r.client.Query(ctx, `
 SELECT table_schema AS schema, table_name AS table, column_name AS column, data_type AS "dataType"
 FROM information_schema.columns
-WHERE table_schema LIKE $1 ESCAPE '\' OR table_name LIKE $1 ESCAPE '\' OR column_name LIKE $1 ESCAPE '\'
+WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+  AND table_schema NOT LIKE 'pg_toast%'
+  AND (table_schema LIKE $1 ESCAPE '\' OR table_name LIKE $1 ESCAPE '\' OR column_name LIKE $1 ESCAPE '\')
 ORDER BY table_schema, table_name, ordinal_position
 LIMIT $3 OFFSET $2`, pattern, max(in.ColumnOffset, 0), limit)
 	return nil, SearchSchemaOutput{Tables: tables, Columns: columns}, err
@@ -148,7 +173,7 @@ LIMIT $3 OFFSET $2`, pattern, max(in.ColumnOffset, 0), limit)
 // ---- describe_table ----
 
 type TableInput struct {
-	Table string `json:"table"`
+	Table string `json:"table" jsonschema:"Table name as table or schema.table; unqualified names use the public schema."`
 }
 
 type DescribeTableOutput struct {
@@ -182,44 +207,56 @@ ORDER BY c.ordinal_position`, schema, table)
 		return nil, DescribeTableOutput{}, err
 	}
 	pks, err := r.client.Query(ctx, `
-SELECT kcu.column_name AS column, kcu.ordinal_position AS ordinal
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-WHERE tc.constraint_type = 'PRIMARY KEY'
-  AND tc.table_schema = $1 AND tc.table_name = $2
-ORDER BY kcu.ordinal_position`, schema, table)
+SELECT column_info.attname AS column, key_info.position AS ordinal
+FROM pg_catalog.pg_constraint constraint_info
+JOIN pg_catalog.pg_class table_info ON table_info.oid = constraint_info.conrelid
+JOIN pg_catalog.pg_namespace schema_info ON schema_info.oid = table_info.relnamespace
+JOIN LATERAL unnest(constraint_info.conkey) WITH ORDINALITY AS key_info(attnum, position) ON true
+JOIN pg_catalog.pg_attribute column_info
+	  ON column_info.attrelid = table_info.oid AND column_info.attnum = key_info.attnum
+WHERE constraint_info.contype = 'p'
+	  AND schema_info.nspname = $1 AND table_info.relname = $2
+ORDER BY key_info.position`, schema, table)
 	if err != nil {
 		return nil, DescribeTableOutput{}, err
 	}
-	fks, err := r.foreignKeys(ctx, schema, table, "")
+	fks, err := r.foreignKeys(ctx, schema, table, "outbound")
 	if err != nil {
 		return nil, DescribeTableOutput{}, err
 	}
 	indexes, err := r.client.Query(ctx, `
-SELECT i.relname AS name,
-       am.amname AS type,
-       ix.indisunique AS unique,
-       a.attname AS column
-
-FROM pg_index ix
-JOIN pg_class i ON ix.indexrelid = i.oid
-JOIN pg_class t ON ix.indrelid = t.oid
-JOIN pg_namespace s ON t.relnamespace = s.oid
-JOIN pg_am am ON i.relam = am.oid
-JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
-WHERE s.nspname = $1 AND t.relname = $2
-  AND ix.indisprimary = false
-ORDER BY i.relname, a.attnum`, schema, table)
+SELECT index_info.relname AS name,
+	   access_method.amname AS type,
+	   index_metadata.indisunique AS unique,
+	   index_metadata.indisvalid AS valid,
+	   pg_catalog.pg_get_indexdef(index_metadata.indexrelid) AS definition,
+	   pg_catalog.to_jsonb(ARRAY(
+	     SELECT pg_catalog.pg_get_indexdef(index_metadata.indexrelid, position, true)
+	     FROM generate_series(1, index_metadata.indnkeyatts) AS position
+	     ORDER BY position
+	   )) AS columns,
+	   pg_catalog.to_jsonb(ARRAY(
+	     SELECT pg_catalog.pg_get_indexdef(index_metadata.indexrelid, position, true)
+	     FROM generate_series(index_metadata.indnkeyatts + 1, index_metadata.indnatts) AS position
+	     ORDER BY position
+	   )) AS "includedColumns"
+FROM pg_catalog.pg_index index_metadata
+JOIN pg_catalog.pg_class index_info ON index_metadata.indexrelid = index_info.oid
+JOIN pg_catalog.pg_class table_info ON index_metadata.indrelid = table_info.oid
+JOIN pg_catalog.pg_namespace schema_info ON table_info.relnamespace = schema_info.oid
+JOIN pg_catalog.pg_am access_method ON index_info.relam = access_method.oid
+WHERE schema_info.nspname = $1 AND table_info.relname = $2
+	  AND index_metadata.indisprimary = false
+ORDER BY index_info.relname`, schema, table)
 	return nil, DescribeTableOutput{Columns: columns, PrimaryKeys: pks, ForeignKeys: fks, Indexes: indexes}, err
 }
 
 // ---- list_table ----
 
 type ListTableInput struct {
-	Schema string `json:"schema"`
-	Filter string `json:"filter"`
-	Limit  int    `json:"limit"`
+	Schema string `json:"schema,omitempty" jsonschema:"Exact schema name; omit to include every schema."`
+	Filter string `json:"filter,omitempty" jsonschema:"Table-name filter; use * as a wildcard."`
+	Limit  int    `json:"limit,omitempty" jsonschema:"Maximum rows; defaults to 200 and is capped at 1000."`
 }
 
 func (r *Registry) listTable(ctx context.Context, _ *mcp.CallToolRequest, in ListTableInput) (*mcp.CallToolResult, RowsOutput, error) {
@@ -231,6 +268,7 @@ SELECT table_schema AS schema, table_name AS table
 FROM information_schema.tables
 WHERE table_type = 'BASE TABLE'
   AND ($1 = '' OR table_schema = $1)
+	AND ($1 <> '' OR (table_schema NOT IN ('information_schema', 'pg_catalog') AND table_schema NOT LIKE 'pg_toast%'))
   AND ($2 = '' OR table_name LIKE $2 ESCAPE '\')
 ORDER BY table_schema, table_name
 LIMIT $3`, in.Schema, patternOrEmpty(in.Filter), limit)
@@ -266,9 +304,9 @@ func (r *Registry) listEnvironments(context.Context, *mcp.CallToolRequest, any) 
 // ---- profile_table ----
 
 type ProfileTableInput struct {
-	Table          string `json:"table"`
-	IncludeSamples bool   `json:"includeSamples"`
-	SampleSize     int    `json:"sampleSize"`
+	Table          string `json:"table" jsonschema:"Table name as table or schema.table; unqualified names use the public schema."`
+	IncludeSamples bool   `json:"includeSamples,omitempty" jsonschema:"Include sample rows when true."`
+	SampleSize     int    `json:"sampleSize,omitempty" jsonschema:"Sample row count; defaults to 10 and is capped at 100."`
 }
 
 type ProfileTableOutput struct {
@@ -305,16 +343,31 @@ ORDER BY ordinal_position`, schema, table)
 		name, _ := col["name"].(string)
 		qcol, err := sqlsafe.QuoteIdentifier(name)
 		if err != nil {
-			continue
+			return nil, ProfileTableOutput{}, err
 		}
 		stats, err := r.client.Query(ctx, fmt.Sprintf(
-			"SELECT COUNT(*) - COUNT(%s) AS \"nullCount\", COUNT(DISTINCT %s) AS \"distinctCount\", MIN(%s) AS min, MAX(%s) AS max FROM %s",
-			qcol, qcol, qcol, qcol, qname))
-		if err == nil && len(stats) > 0 {
-			stats[0]["name"] = name
-			stats[0]["dataType"] = col["dataType"]
-			summaries = append(summaries, stats[0])
+			"SELECT COUNT(*) FILTER (WHERE %s IS NULL) AS \"nullCount\", COUNT(DISTINCT pg_catalog.to_jsonb(%s)) AS \"distinctCount\" FROM %s",
+			qcol, qcol, qname))
+		if err != nil {
+			return nil, ProfileTableOutput{}, err
 		}
+		if len(stats) == 0 {
+			return nil, ProfileTableOutput{}, fmt.Errorf("profiling column %q returned no result", name)
+		}
+		stats[0]["name"] = name
+		stats[0]["dataType"] = col["dataType"]
+		minMax, minMaxErr := r.client.Query(ctx, fmt.Sprintf("SELECT MIN(%s) AS min, MAX(%s) AS max FROM %s", qcol, qcol, qname))
+		if minMaxErr == nil && len(minMax) > 0 {
+			stats[0]["min"] = minMax[0]["min"]
+			stats[0]["max"] = minMax[0]["max"]
+			stats[0]["minMaxAvailable"] = true
+		} else {
+			if ctx.Err() != nil {
+				return nil, ProfileTableOutput{}, ctx.Err()
+			}
+			stats[0]["minMaxAvailable"] = false
+		}
+		summaries = append(summaries, stats[0])
 	}
 	var samples []map[string]any
 	if in.IncludeSamples {
@@ -350,31 +403,39 @@ func (r *Registry) inspectRelationships(ctx context.Context, _ *mcp.CallToolRequ
 }
 
 func (r *Registry) foreignKeys(ctx context.Context, schema, table, direction string) ([]map[string]any, error) {
-	filter := "(kcu.table_schema = $1 AND kcu.table_name = $2) OR (ccu.table_schema = $1 AND ccu.table_name = $2)"
+	var filter string
 	switch direction {
 	case "outbound":
-		filter = "kcu.table_schema = $1 AND kcu.table_name = $2"
+		filter = "source_namespace.nspname = $1 AND source_table.relname = $2"
 	case "inbound":
-		filter = "ccu.table_schema = $1 AND ccu.table_name = $2"
+		filter = "target_namespace.nspname = $1 AND target_table.relname = $2"
+	default:
+		return nil, fmt.Errorf("invalid relationship direction %q", direction)
 	}
 	return r.client.Query(ctx, `
 SELECT
-    tc.constraint_name AS "foreignKey",
-    kcu.table_schema AS schema,
-    kcu.table_name AS table,
-    kcu.column_name AS column,
-    ccu.table_schema AS "referencedSchema",
-    ccu.table_name AS "referencedTable",
-    ccu.column_name AS "referencedColumn"
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-JOIN information_schema.referential_constraints rc
-  ON tc.constraint_name = rc.constraint_name AND tc.table_schema = rc.constraint_schema
-JOIN information_schema.constraint_column_usage ccu
-  ON rc.unique_constraint_name = ccu.constraint_name AND rc.unique_constraint_schema = ccu.constraint_schema
-WHERE tc.constraint_type = 'FOREIGN KEY' AND (`+filter+`)
-ORDER BY tc.constraint_name, kcu.ordinal_position`, schema, table)
+	    constraint_info.conname AS "foreignKey",
+	    source_namespace.nspname AS schema,
+	    source_table.relname AS table,
+	    source_column.attname AS column,
+	    target_namespace.nspname AS "referencedSchema",
+	    target_table.relname AS "referencedTable",
+	    target_column.attname AS "referencedColumn",
+	    pg_catalog.pg_get_constraintdef(constraint_info.oid, true) AS definition
+FROM pg_catalog.pg_constraint constraint_info
+JOIN pg_catalog.pg_class source_table ON source_table.oid = constraint_info.conrelid
+JOIN pg_catalog.pg_namespace source_namespace ON source_namespace.oid = source_table.relnamespace
+JOIN pg_catalog.pg_class target_table ON target_table.oid = constraint_info.confrelid
+JOIN pg_catalog.pg_namespace target_namespace ON target_namespace.oid = target_table.relnamespace
+JOIN LATERAL unnest(constraint_info.conkey) WITH ORDINALITY AS source_key(attnum, position) ON true
+JOIN LATERAL unnest(constraint_info.confkey) WITH ORDINALITY AS target_key(attnum, position)
+	  ON target_key.position = source_key.position
+JOIN pg_catalog.pg_attribute source_column
+	  ON source_column.attrelid = source_table.oid AND source_column.attnum = source_key.attnum
+JOIN pg_catalog.pg_attribute target_column
+	  ON target_column.attrelid = target_table.oid AND target_column.attnum = target_key.attnum
+WHERE constraint_info.contype = 'f' AND (`+filter+`)
+ORDER BY source_namespace.nspname, source_table.relname, constraint_info.conname, source_key.position`, schema, table)
 }
 
 // ---- inspect_dependencies ----
@@ -407,8 +468,8 @@ ORDER BY schema, object`, schema, table)
 // ---- read_data ----
 
 type QueryInput struct {
-	Query   string `json:"query"`
-	MaxRows int    `json:"maxRows"`
+	Query   string `json:"query" jsonschema:"One read-only SELECT statement. Multiple or mutating statements are rejected."`
+	MaxRows int    `json:"maxRows,omitempty" jsonschema:"Maximum returned rows, capped by POSTGRESQL_MAX_ROWS_DEFAULT."`
 }
 
 func (r *Registry) readData(ctx context.Context, _ *mcp.CallToolRequest, in QueryInput) (*mcp.CallToolResult, RowsOutput, error) {
@@ -425,13 +486,14 @@ type ExplainOutput struct {
 	Plan []map[string]any `json:"plan"`
 }
 
-func (r *Registry) explainQuery(ctx context.Context, _ *mcp.CallToolRequest, in QueryInput) (*mcp.CallToolResult, ExplainOutput, error) {
-	if !sqlsafe.IsReadOnlyQuery(in.Query) {
-		return nil, ExplainOutput{}, fmt.Errorf("only read-only SELECT queries can be explained")
-	}
+type ExplainInput struct {
+	Query string `json:"query" jsonschema:"One read-only SELECT statement to plan. Multiple or mutating statements are rejected."`
+}
+
+func (r *Registry) explainQuery(ctx context.Context, _ *mcp.CallToolRequest, in ExplainInput) (*mcp.CallToolResult, ExplainOutput, error) {
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
-	plan, err := r.client.Query(ctx, "EXPLAIN (FORMAT JSON) "+in.Query)
+	plan, err := r.client.ExplainReadOnly(ctx, in.Query)
 	return nil, ExplainOutput{Plan: plan}, err
 }
 
@@ -559,21 +621,25 @@ SELECT a.attname AS name,
        a.atthasdef AS "hasDefault",
        pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS "defaultVal",
        a.attidentity != '' AS identity,
-       CASE a.attidentity WHEN 'a' THEN 'ALWAYS' WHEN 'd' THEN 'BY DEFAULT' ELSE '' END AS "identityType"
+	   CASE a.attidentity WHEN 'a' THEN 'ALWAYS' WHEN 'd' THEN 'BY DEFAULT' ELSE '' END AS "identityType",
+	   a.attgenerated AS "generatedType"
 FROM pg_catalog.pg_attribute a
 JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 LEFT JOIN pg_catalog.pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
 WHERE n.nspname = $1 AND c.relname = $2
-  AND a.attnum > 0 AND NOT a.attisdropped
+	  AND c.relkind IN ('r', 'p')
+	  AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attnum`, schema, table)
 	if err != nil {
 		return nil, DDLOutput{}, err
 	}
 
-	// Build column definitions
-	var colDefs []string
-	var pkCols []string
+	if len(cols) == 0 {
+		return nil, DDLOutput{}, fmt.Errorf("table %s.%s does not exist or is not a table", schema, table)
+	}
+
+	colDefs := make([]string, 0, len(cols))
 	for _, col := range cols {
 		name, _ := col["name"].(string)
 		typ, _ := col["type"].(string)
@@ -582,19 +648,25 @@ ORDER BY a.attnum`, schema, table)
 			return nil, DDLOutput{}, err
 		}
 		def := qcol + " " + typ
-		if ident, _ := col["identity"].(bool); ident {
+		identity, _ := col["identity"].(bool)
+		generatedType, _ := col["generatedType"].(string)
+		defaultValue, _ := col["defaultVal"].(string)
+		if identity {
 			idt, _ := col["identityType"].(string)
 			if idt == "ALWAYS" {
 				def += " GENERATED ALWAYS AS IDENTITY"
 			} else {
 				def += " GENERATED BY DEFAULT AS IDENTITY"
 			}
-		}
-		if hasDef, _ := col["hasDefault"].(bool); hasDef {
-			dv, _ := col["defaultVal"].(string)
-			if dv != "" && !strings.HasPrefix(dv, "nextval(") {
-				def += " DEFAULT " + dv
+		} else if generatedType != "" {
+			def += " GENERATED ALWAYS AS (" + defaultValue + ")"
+			if generatedType == "v" {
+				def += " VIRTUAL"
+			} else {
+				def += " STORED"
 			}
+		} else if hasDefault, _ := col["hasDefault"].(bool); hasDefault && defaultValue != "" {
+			def += " DEFAULT " + defaultValue
 		}
 		if notNull, _ := col["notNull"].(bool); notNull {
 			def += " NOT NULL"
@@ -602,28 +674,26 @@ ORDER BY a.attnum`, schema, table)
 		colDefs = append(colDefs, def)
 	}
 
-	// Primary keys
-	pks, err := r.client.Query(ctx, `
-SELECT a.attname AS column
-FROM pg_catalog.pg_index i
-JOIN pg_catalog.pg_class c ON i.indrelid = c.oid
-JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
-JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
-WHERE i.indisprimary AND n.nspname = $1 AND c.relname = $2
-ORDER BY a.attnum`, schema, table)
+	constraints, err := r.client.Query(ctx, `
+SELECT constraint_info.conname AS name,
+	   pg_catalog.pg_get_constraintdef(constraint_info.oid, true) AS definition
+FROM pg_catalog.pg_constraint constraint_info
+JOIN pg_catalog.pg_class table_info ON table_info.oid = constraint_info.conrelid
+JOIN pg_catalog.pg_namespace schema_info ON schema_info.oid = table_info.relnamespace
+WHERE schema_info.nspname = $1 AND table_info.relname = $2
+	  AND constraint_info.contype IN ('p', 'u', 'f', 'c', 'x')
+ORDER BY CASE constraint_info.contype WHEN 'p' THEN 0 ELSE 1 END, constraint_info.conname`, schema, table)
 	if err != nil {
 		return nil, DDLOutput{}, err
 	}
-	for _, pk := range pks {
-		name, _ := pk["column"].(string)
-		qcol, err := sqlsafe.QuoteIdentifier(name)
+	for _, constraint := range constraints {
+		name, _ := constraint["name"].(string)
+		definition, _ := constraint["definition"].(string)
+		quotedName, err := sqlsafe.QuoteIdentifier(name)
 		if err != nil {
 			return nil, DDLOutput{}, err
 		}
-		pkCols = append(pkCols, qcol)
-	}
-	if len(pkCols) > 0 {
-		colDefs = append(colDefs, "PRIMARY KEY ("+strings.Join(pkCols, ", ")+")")
+		colDefs = append(colDefs, "CONSTRAINT "+quotedName+" "+definition)
 	}
 
 	ddl := "CREATE TABLE " + qname + " (\n    " + strings.Join(colDefs, ",\n    ") + "\n);"
@@ -632,9 +702,22 @@ ORDER BY a.attnum`, schema, table)
 
 // ---- table_size ----
 
-func (r *Registry) tableSize(ctx context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, RowsOutput, error) {
+type TableSizeInput struct {
+	Table string `json:"table,omitempty" jsonschema:"Exact table as table or schema.table; omit to list the largest user tables."`
+	Limit int    `json:"limit,omitempty" jsonschema:"Maximum rows; defaults to 200 and is capped at 1000."`
+}
+
+func (r *Registry) tableSize(ctx context.Context, _ *mcp.CallToolRequest, in TableSizeInput) (*mcp.CallToolResult, RowsOutput, error) {
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
+	var schema, table string
+	var err error
+	if strings.TrimSpace(in.Table) != "" {
+		schema, table, err = splitTable(in.Table)
+		if err != nil {
+			return nil, RowsOutput{}, err
+		}
+	}
 	rows, err := r.client.Query(ctx, `
 SELECT n.nspname AS schema,
        c.relname AS table,
@@ -650,16 +733,19 @@ SELECT n.nspname AS schema,
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 WHERE c.relkind IN ('r', 'm')
-  AND n.nspname NOT IN ('information_schema', 'pg_catalog')
-ORDER BY pg_catalog.pg_total_relation_size(c.oid) DESC`)
+	  AND n.nspname NOT LIKE 'pg_%'
+	  AND n.nspname != 'information_schema'
+	  AND ($1 = '' OR (n.nspname = $1 AND c.relname = $2))
+ORDER BY pg_catalog.pg_total_relation_size(c.oid) DESC
+LIMIT $3`, schema, table, bounded(in.Limit, 200, 1000))
 	return nil, RowsOutput{Rows: rows}, err
 }
 
 // ---- insert_data ----
 
 type InsertInput struct {
-	Table string           `json:"table"`
-	Rows  []map[string]any `json:"rows"`
+	Table string           `json:"table" jsonschema:"Target table as table or schema.table."`
+	Rows  []map[string]any `json:"rows" jsonschema:"One or more objects whose keys are column names. All rows are inserted atomically."`
 }
 
 type MutationOutput struct {
@@ -679,13 +765,15 @@ func (r *Registry) insertData(ctx context.Context, _ *mcp.CallToolRequest, in In
 	if err != nil {
 		return nil, MutationOutput{}, err
 	}
-	ctx, cancel := r.client.TimeoutContext(ctx)
-	defer cancel()
-	var total int64
-	for _, row := range in.Rows {
+	type command struct {
+		query string
+		args  []any
+	}
+	commands := make([]command, 0, len(in.Rows))
+	for rowIndex, row := range in.Rows {
 		cols := sortedKeys(row)
 		if len(cols) == 0 {
-			return nil, MutationOutput{}, fmt.Errorf("row cannot be empty")
+			return nil, MutationOutput{}, fmt.Errorf("row %d cannot be empty", rowIndex+1)
 		}
 		qcols := make([]string, len(cols))
 		params := make([]string, len(cols))
@@ -699,11 +787,35 @@ func (r *Registry) insertData(ctx context.Context, _ *mcp.CallToolRequest, in In
 			params[i] = fmt.Sprintf("$%d", i+1)
 			args[i] = row[col]
 		}
-		n, err := r.client.Exec(ctx, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(qcols, ", "), strings.Join(params, ", ")), args...)
+		commands = append(commands, command{
+			query: fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(qcols, ", "), strings.Join(params, ", ")),
+			args:  args,
+		})
+	}
+
+	ctx, cancel := r.client.TimeoutContext(ctx)
+	defer cancel()
+	tx, err := r.client.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, MutationOutput{}, fmt.Errorf("begin insert transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	var total int64
+	for rowIndex, command := range commands {
+		result, err := tx.ExecContext(ctx, command.query, command.args...)
 		if err != nil {
-			return nil, MutationOutput{}, err
+			return nil, MutationOutput{}, fmt.Errorf("insert row %d: %w", rowIndex+1, err)
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return nil, MutationOutput{}, fmt.Errorf("insert row %d: %w", rowIndex+1, err)
 		}
 		total += n
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, MutationOutput{}, fmt.Errorf("commit insert transaction: %w", err)
 	}
 	return nil, MutationOutput{Executed: true, RowsAffected: total}, nil
 }
@@ -711,11 +823,11 @@ func (r *Registry) insertData(ctx context.Context, _ *mcp.CallToolRequest, in In
 // ---- update_data / delete_data shared types ----
 
 type WhereMutationInput struct {
-	Table   string         `json:"table"`
-	Values  map[string]any `json:"values"`
-	Where   string         `json:"where"`
-	Params  map[string]any `json:"params"`
-	Confirm bool           `json:"confirm"`
+	Table   string         `json:"table" jsonschema:"Target table as table or schema.table."`
+	Values  map[string]any `json:"values" jsonschema:"Column names and replacement values."`
+	Where   string         `json:"where" jsonschema:"Required SQL predicate using named placeholders such as id = $id."`
+	Params  map[string]any `json:"params,omitempty" jsonschema:"Values for every named placeholder in where."`
+	Confirm bool           `json:"confirm,omitempty" jsonschema:"Execute instead of previewing when confirmation is required."`
 }
 
 func (r *Registry) updateData(ctx context.Context, _ *mcp.CallToolRequest, in WhereMutationInput) (*mcp.CallToolResult, MutationOutput, error) {
@@ -725,17 +837,22 @@ func (r *Registry) updateData(ctx context.Context, _ *mcp.CallToolRequest, in Wh
 	if len(in.Values) == 0 {
 		return nil, MutationOutput{}, fmt.Errorf("values is required")
 	}
-	table, where, args, err := mutationTarget(in.Table, in.Where, in.Params)
+	cols := sortedKeys(in.Values)
+	execute := !r.client.Config.RequireConfirmation || in.Confirm
+	offset := 0
+	if execute {
+		offset = len(cols)
+	}
+	table, where, args, err := mutationTarget(in.Table, in.Where, in.Params, offset)
 	if err != nil {
 		return nil, MutationOutput{}, err
 	}
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
-	if r.client.Config.RequireConfirmation && !in.Confirm {
-		preview, err := r.client.Query(ctx, fmt.Sprintf("SELECT * FROM %s WHERE %s LIMIT %d", table, where, r.client.Config.MaxRowsDefault), args...)
+	if !execute {
+		preview, err := r.client.Query(ctx, fmt.Sprintf("SELECT * FROM %s WHERE %s\nLIMIT %d", table, where, r.client.Config.MaxRowsDefault), args...)
 		return nil, MutationOutput{Executed: false, Preview: preview}, err
 	}
-	cols := sortedKeys(in.Values)
 	set := make([]string, len(cols))
 	allArgs := make([]any, 0, len(cols)+len(args))
 	for i, col := range cols {
@@ -747,50 +864,56 @@ func (r *Registry) updateData(ctx context.Context, _ *mcp.CallToolRequest, in Wh
 		allArgs = append(allArgs, in.Values[col])
 	}
 	allArgs = append(allArgs, args...)
-	n, err := r.client.Exec(ctx, fmt.Sprintf("UPDATE %s SET %s WHERE %s", table, strings.Join(set, ", "), renumberWhere(where, len(cols))), allArgs...)
-	return nil, MutationOutput{Executed: true, RowsAffected: n}, err
+	n, err := r.client.Exec(ctx, fmt.Sprintf("UPDATE %s SET %s WHERE %s", table, strings.Join(set, ", "), where), allArgs...)
+	if err != nil {
+		return nil, MutationOutput{}, err
+	}
+	return nil, MutationOutput{Executed: true, RowsAffected: n}, nil
 }
 
 // ---- delete_data ----
 
 type DeleteInput struct {
-	Table   string         `json:"table"`
-	Where   string         `json:"where"`
-	Params  map[string]any `json:"params"`
-	Confirm bool           `json:"confirm"`
+	Table   string         `json:"table" jsonschema:"Target table as table or schema.table."`
+	Where   string         `json:"where" jsonschema:"Required SQL predicate using named placeholders such as id = $id."`
+	Params  map[string]any `json:"params,omitempty" jsonschema:"Values for every named placeholder in where."`
+	Confirm bool           `json:"confirm,omitempty" jsonschema:"Execute instead of previewing when confirmation is required."`
 }
 
 func (r *Registry) deleteData(ctx context.Context, _ *mcp.CallToolRequest, in DeleteInput) (*mcp.CallToolResult, MutationOutput, error) {
 	if !r.client.Config.AccessLevel.AllowsDML() {
 		return nil, MutationOutput{}, fmt.Errorf("delete_data requires DML-RW or DDL-RW")
 	}
-	table, where, args, err := mutationTarget(in.Table, in.Where, in.Params)
+	table, where, args, err := mutationTarget(in.Table, in.Where, in.Params, 0)
 	if err != nil {
 		return nil, MutationOutput{}, err
 	}
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	if r.client.Config.RequireConfirmation && !in.Confirm {
-		preview, err := r.client.Query(ctx, fmt.Sprintf("SELECT * FROM %s WHERE %s LIMIT %d", table, where, r.client.Config.MaxRowsDefault), args...)
+		preview, err := r.client.Query(ctx, fmt.Sprintf("SELECT * FROM %s WHERE %s\nLIMIT %d", table, where, r.client.Config.MaxRowsDefault), args...)
 		return nil, MutationOutput{Executed: false, Preview: preview}, err
 	}
 	n, err := r.client.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s", table, where), args...)
-	return nil, MutationOutput{Executed: true, RowsAffected: n}, err
+	if err != nil {
+		return nil, MutationOutput{}, err
+	}
+	return nil, MutationOutput{Executed: true, RowsAffected: n}, nil
 }
 
 // ---- create_table ----
 
 type ColumnDef struct {
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	Nullable   bool   `json:"nullable"`
-	PrimaryKey bool   `json:"primaryKey"`
-	Identity   bool   `json:"identity"`
+	Name       string `json:"name" jsonschema:"Column name."`
+	Type       string `json:"type" jsonschema:"PostgreSQL data type, optionally parameterized or schema-qualified."`
+	Nullable   bool   `json:"nullable" jsonschema:"Whether the column accepts NULL; false emits NOT NULL."`
+	PrimaryKey bool   `json:"primaryKey,omitempty" jsonschema:"Include the column in the primary key."`
+	Identity   bool   `json:"identity,omitempty" jsonschema:"Generate values by default using a PostgreSQL identity."`
 }
 
 type CreateTableInput struct {
-	Table   string      `json:"table"`
-	Columns []ColumnDef `json:"columns"`
+	Table   string      `json:"table" jsonschema:"New table name as table or schema.table."`
+	Columns []ColumnDef `json:"columns" jsonschema:"One or more column definitions."`
 }
 
 func (r *Registry) createTable(ctx context.Context, _ *mcp.CallToolRequest, in CreateTableInput) (*mcp.CallToolResult, MutationOutput, error) {
@@ -806,15 +929,20 @@ func (r *Registry) createTable(ctx context.Context, _ *mcp.CallToolRequest, in C
 	}
 	defs := make([]string, 0, len(in.Columns)+1)
 	var pks []string
+	seenColumns := make(map[string]bool, len(in.Columns))
 	for _, col := range in.Columns {
 		qcol, err := sqlsafe.QuoteIdentifier(col.Name)
 		if err != nil {
 			return nil, MutationOutput{}, err
 		}
+		if seenColumns[qcol] {
+			return nil, MutationOutput{}, fmt.Errorf("duplicate column %q", col.Name)
+		}
+		seenColumns[qcol] = true
 		if !validSQLType(col.Type) {
 			return nil, MutationOutput{}, fmt.Errorf("invalid column type %q", col.Type)
 		}
-		def := qcol + " " + col.Type
+		def := qcol + " " + strings.TrimSpace(col.Type)
 		if col.Identity {
 			def += " GENERATED BY DEFAULT AS IDENTITY"
 		}
@@ -834,16 +962,19 @@ func (r *Registry) createTable(ctx context.Context, _ *mcp.CallToolRequest, in C
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	n, err := r.client.Exec(ctx, fmt.Sprintf("CREATE TABLE %s (%s)", table, strings.Join(defs, ", ")))
-	return nil, MutationOutput{Executed: true, RowsAffected: n}, err
+	if err != nil {
+		return nil, MutationOutput{}, err
+	}
+	return nil, MutationOutput{Executed: true, RowsAffected: n}, nil
 }
 
 // ---- create_index ----
 
 type CreateIndexInput struct {
-	Table   string   `json:"table"`
-	Name    string   `json:"name"`
-	Columns []string `json:"columns"`
-	Unique  bool     `json:"unique"`
+	Table   string   `json:"table" jsonschema:"Indexed table as table or schema.table."`
+	Name    string   `json:"name" jsonschema:"New unqualified index name."`
+	Columns []string `json:"columns" jsonschema:"One or more table column names in index order."`
+	Unique  bool     `json:"unique,omitempty" jsonschema:"Create a unique index when true."`
 }
 
 func (r *Registry) createIndex(ctx context.Context, _ *mcp.CallToolRequest, in CreateIndexInput) (*mcp.CallToolResult, MutationOutput, error) {
@@ -875,14 +1006,17 @@ func (r *Registry) createIndex(ctx context.Context, _ *mcp.CallToolRequest, in C
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	n, err := r.client.Exec(ctx, fmt.Sprintf("%s %s ON %s (%s)", prefix, name, table, strings.Join(cols, ", ")))
-	return nil, MutationOutput{Executed: true, RowsAffected: n}, err
+	if err != nil {
+		return nil, MutationOutput{}, err
+	}
+	return nil, MutationOutput{Executed: true, RowsAffected: n}, nil
 }
 
 // ---- drop_table ----
 
 type DropTableInput struct {
-	Table   string `json:"table"`
-	Confirm bool   `json:"confirm"`
+	Table   string `json:"table" jsonschema:"Table to drop as table or schema.table."`
+	Confirm bool   `json:"confirm,omitempty" jsonschema:"Execute instead of returning a no-op preview when confirmation is required."`
 }
 
 func (r *Registry) dropTable(ctx context.Context, _ *mcp.CallToolRequest, in DropTableInput) (*mcp.CallToolResult, MutationOutput, error) {
@@ -894,12 +1028,25 @@ func (r *Registry) dropTable(ctx context.Context, _ *mcp.CallToolRequest, in Dro
 		return nil, MutationOutput{}, err
 	}
 	if r.client.Config.RequireConfirmation && !in.Confirm {
-		return nil, MutationOutput{Executed: false}, nil
+		ctx, cancel := r.client.TimeoutContext(ctx)
+		defer cancel()
+		preview, err := r.client.Query(ctx, `
+SELECT schema_info.nspname AS schema,
+	   table_info.relname AS table,
+	   table_info.reltuples::bigint AS "estimatedRows",
+	   pg_catalog.pg_size_pretty(pg_catalog.pg_total_relation_size(table_info.oid)) AS "totalSize"
+FROM pg_catalog.pg_class table_info
+JOIN pg_catalog.pg_namespace schema_info ON schema_info.oid = table_info.relnamespace
+WHERE table_info.oid = pg_catalog.to_regclass($1)`, table)
+		return nil, MutationOutput{Executed: false, Preview: preview}, err
 	}
 	ctx, cancel := r.client.TimeoutContext(ctx)
 	defer cancel()
 	n, err := r.client.Exec(ctx, "DROP TABLE "+table)
-	return nil, MutationOutput{Executed: true, RowsAffected: n}, err
+	if err != nil {
+		return nil, MutationOutput{}, err
+	}
+	return nil, MutationOutput{Executed: true, RowsAffected: n}, nil
 }
 
 // ---- helpers ----
@@ -962,7 +1109,7 @@ func validSQLType(s string) bool {
 	return sqlTypeRE.MatchString(strings.TrimSpace(s))
 }
 
-func mutationTarget(tableName, where string, params map[string]any) (string, string, []any, error) {
+func mutationTarget(tableName, where string, params map[string]any, parameterOffset int) (string, string, []any, error) {
 	table, err := sqlsafe.QuoteMultipart(tableName)
 	if err != nil {
 		return "", "", nil, err
@@ -971,24 +1118,16 @@ func mutationTarget(tableName, where string, params map[string]any) (string, str
 	if where == "" {
 		return "", "", nil, fmt.Errorf("where is required")
 	}
-	if strings.Contains(where, ";") || !sqlsafe.IsReadOnlyQuery("SELECT * FROM x WHERE "+where) {
+	if !sqlsafe.IsReadOnlyQuery("SELECT * FROM x WHERE (\n" + where + "\n)") {
 		return "", "", nil, fmt.Errorf("where clause contains disallowed SQL")
 	}
-	keys := sortedKeys(params)
-	args := make([]any, 0, len(keys))
-	for i, key := range keys {
-		if _, err := sqlsafe.QuoteIdentifier(key); err != nil {
-			return "", "", nil, err
-		}
-		where = strings.ReplaceAll(where, "$"+key, fmt.Sprintf("$%d", i+1))
-		args = append(args, params[key])
+	where, args, err := sqlsafe.BindNamedParameters(where, params, parameterOffset)
+	if err != nil {
+		return "", "", nil, err
 	}
-	return table, where, args, nil
+	return table, "(\n" + where + "\n)", args, nil
 }
 
-func renumberWhere(where string, offset int) string {
-	for i := 100; i >= 1; i-- {
-		where = strings.ReplaceAll(where, fmt.Sprintf("$%d", i), fmt.Sprintf("$%d", i+offset))
-	}
-	return where
+func boolPointer(value bool) *bool {
+	return &value
 }
