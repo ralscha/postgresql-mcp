@@ -47,9 +47,9 @@ func (r *Registry) tool(name string) *mcp.Tool {
 		Name:        name,
 		Description: toolDescriptions[name],
 		Annotations: &mcp.ToolAnnotations{
-			DestructiveHint: boolPointer(destructive),
+			DestructiveHint: new(destructive),
 			IdempotentHint:  !mutating,
-			OpenWorldHint:   boolPointer(false),
+			OpenWorldHint:   new(false),
 			ReadOnlyHint:    !mutating,
 		},
 	}
@@ -1128,6 +1128,7 @@ func mutationTarget(tableName, where string, params map[string]any, parameterOff
 	return table, "(\n" + where + "\n)", args, nil
 }
 
+//go:fix inline
 func boolPointer(value bool) *bool {
-	return &value
+	return new(value)
 }
